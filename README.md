@@ -30,7 +30,9 @@ Eso es este proyecto. Un archivo `.db` que puedes abrir con cualquier cliente SQ
 - **Incremental por UID** — re-ejecutable sin duplicar. La clave única es `(cuenta, uid, carpeta)`.
 - **Credenciales solo por entorno** — el JSON de cuentas nunca contiene contraseñas.
 - **Búsqueda de texto completo** con FTS5 sobre asunto y cuerpo.
-- **Adjuntos deduplicados** por hash MD5 del contenido.
+- **Adjuntos con nombre único** (UID + nombre original + hash del contenido), así nunca se pisan entre sí.
+- **No marca nada como leído** — abre las carpetas en solo lectura y descarga con `BODY.PEEK[]`.
+- **Seguro ante cambios de UIDVALIDITY** — si el servidor recrea una carpeta, lo ya guardado se conserva en `"<carpeta> [uidvalidity N]"` y lo nuevo se descarga limpio.
 - **Modo histórico completo** (`--all`) recorriendo año por año para no chocar con los límites de Gmail.
 - **Multi-cuenta y multi-carpeta** desde un solo archivo de configuración.
 - **Cero dependencias** — `imaplib`, `sqlite3`, `email` de la biblioteca estándar.
@@ -38,7 +40,7 @@ Eso es este proyecto. Un archivo `.db` que puedes abrir con cualquier cliente SQ
 ## Instalación
 
 ```bash
-git clone https://github.com/TU_USUARIO/imap-to-sqlite.git
+git clone https://github.com/javieratcservicios/imap-to-sqlite.git
 cd imap-to-sqlite
 # No hay requirements: Python 3.10+ es todo lo que necesitas.
 ```
@@ -109,6 +111,8 @@ python imap_to_sqlite.py --config accounts.json --all \
 └── yo@dominio.com/
     ├── attachments/                 # adjuntos, nombre único por hash
     └── raw/                         # .eml (solo con --save-eml)
+        ├── INBOX/                   # una subcarpeta por carpeta IMAP
+        └── Enviados/
 ```
 
 ## Consultas útiles
@@ -155,7 +159,8 @@ Backs up IMAP mailboxes into SQLite so you can query your email with plain SQL. 
 - Incremental by UID — safe to re-run, never duplicates.
 - Passwords come from environment variables, never from the config file.
 - Full-text search over subject and body via FTS5.
-- Attachments deduplicated by content hash.
+- Never marks mail as read (read-only select + `BODY.PEEK[]`).
+- Handles UIDVALIDITY changes without mixing up messages.
 - `--all` walks year by year to stay clear of provider rate limits.
 
 ```bash
