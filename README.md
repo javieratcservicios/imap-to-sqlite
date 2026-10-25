@@ -4,6 +4,11 @@
 
 **Local email backup and SQL search for IMAP mailboxes.** Syncs one or many IMAP accounts into SQLite — bodies, headers and attachments on disk. Standard library only.
 
+
+![Salida real: estado de sincronización y búsqueda de texto completo con FTS5](docs/example-status.png)
+
+<sub>Salida real: estado de sincronización y búsqueda de texto completo con FTS5 · Real output: sync status and full-text search with FTS5</sub>
+
 ---
 
 ## Por qué existe
