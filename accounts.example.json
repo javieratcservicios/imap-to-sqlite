@@ -1,0 +1,10 @@
+[
+  {
+    "email": "yo@ejemplo.com",
+    "password_env": "IMAP_PASS_EJEMPLO",
+    "imap_server": "imap.gmail.com",
+    "imap_port": 993,
+    "folders": ["INBOX"],
+    "label": "Cuenta personal"
+  }
+]

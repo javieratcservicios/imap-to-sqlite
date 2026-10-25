@@ -1,0 +1,43 @@
+# ─── Secretos y configuración local ───
+accounts.json
+.env
+*.env
+
+# ─── Datos sincronizados (nunca al repo) ───
+mail.db
+mail.db-wal
+mail.db-shm
+mailbox/
+attachments/
+raw/
+*.eml
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# ─── Pruebas y cobertura ───
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── Editores y sistema ───
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Logs ───
+*.log
