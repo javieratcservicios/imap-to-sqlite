@@ -105,15 +105,29 @@ def safe_filename(name: str, max_len: int = 180) -> str:
     return name or "unnamed"
 
 
-def parse_date(raw) -> datetime | None:
-    """Convierte una cabecera Date a datetime naive en hora local."""
+def parse_date(raw) -> str | None:
+    """
+    Convierte una cabecera Date a texto 'AAAA-MM-DD HH:MM:SS' en hora local.
+
+    Se guarda como texto explícito: el adaptador de datetime por defecto de
+    sqlite3 está obsoleto desde Python 3.12.
+    """
     if not raw:
         return None
     try:
         dt = parsedate_to_datetime(raw)
-        return dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
+        if dt.tzinfo:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt.isoformat(sep=" ", timespec="seconds")
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def imap_date(d: datetime) -> str:
+    """Fecha IMAP (01-Jan-2026) sin depender del locale del sistema."""
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    return f"{d.day:02d}-{months[d.month - 1]}-{d.year}"
 
 
 # ───────────────────────────── Base de datos ───────────────────────────
@@ -166,6 +180,13 @@ CREATE TABLE IF NOT EXISTS attachments (
     filepath     TEXT,
     downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (email_id) REFERENCES emails(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS folder_state (
+    account_id  INTEGER NOT NULL,
+    folder      TEXT NOT NULL,
+    uidvalidity INTEGER,
+    PRIMARY KEY (account_id, folder)
 );
 
 CREATE INDEX IF NOT EXISTS idx_emails_account ON emails(account_id);
@@ -273,12 +294,56 @@ class MailboxSync:
         return {r["uid"] for r in cur.fetchall()}
 
     # ---- Sincronización ----
+    def _current_uidvalidity(self) -> int | None:
+        """UIDVALIDITY de la carpeta recién seleccionada (respuesta de SELECT)."""
+        typ, data = self.imap.response("UIDVALIDITY")
+        if data and data[0]:
+            try:
+                return int(data[0])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _check_uidvalidity(self, folder: str) -> None:
+        """
+        Los UID solo son estables mientras UIDVALIDITY no cambie. Si el
+        servidor la cambia (migración, carpeta recreada), los UID viejos
+        apuntan a otros mensajes. En ese caso los correos ya guardados se
+        conservan, pero se mueven a una carpeta de archivo para que no
+        bloqueen ni se confundan con los UID nuevos.
+        """
+        validity = self._current_uidvalidity()
+        if validity is None:
+            return
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT uidvalidity FROM folder_state WHERE account_id = ? AND folder = ?",
+            (self.account_id, folder),
+        )
+        row = cur.fetchone()
+        if row and row["uidvalidity"] != validity:
+            archived = f"{folder} [uidvalidity {row['uidvalidity']}]"
+            print(f"  ! UIDVALIDITY de {folder} cambió "
+                  f"({row['uidvalidity']} → {validity}); lo guardado pasa a '{archived}'")
+            cur.execute(
+                "UPDATE emails SET folder = ? WHERE account_id = ? AND folder = ?",
+                (archived, self.account_id, folder),
+            )
+        cur.execute(
+            """INSERT INTO folder_state (account_id, folder, uidvalidity)
+               VALUES (?, ?, ?)
+               ON CONFLICT(account_id, folder) DO UPDATE SET uidvalidity = excluded.uidvalidity""",
+            (self.account_id, folder, validity),
+        )
+        self.conn.commit()
+
     def sync_folder(self, folder: str) -> tuple[int, int]:
-        typ, _ = self.imap.select(f'"{folder}"')
+        typ, _ = self.imap.select(f'"{folder}"', readonly=True)
         if typ != "OK":
             print(f"  ! no se pudo abrir la carpeta {folder}")
             return (0, 0)
 
+        self._check_uidvalidity(folder)
         known = self.known_uids(folder)
         total_new = total_att = 0
 
@@ -291,7 +356,7 @@ class MailboxSync:
                 total_att += a
                 time.sleep(1.0)
         else:
-            since = (datetime.now() - timedelta(days=self.since_days)).strftime("%d-%b-%Y")
+            since = imap_date(datetime.now() - timedelta(days=self.since_days))
             total_new, total_att = self._run_search(f"(SINCE {since})", folder, known)
 
         cur = self.conn.cursor()
@@ -312,51 +377,37 @@ class MailboxSync:
         return (total_new, total_att)
 
     def _run_search(self, criteria: str, folder: str, known: set[int]) -> tuple[int, int]:
-        typ, data = self.imap.search(None, criteria)
+        """
+        Busca por UID (UID SEARCH), no por número de secuencia: los números
+        de secuencia se recorren si alguien borra correos mientras se
+        sincroniza, y se descargarían mensajes equivocados.
+        """
+        typ, data = self.imap.uid("SEARCH", None, criteria)
         if typ != "OK" or not data or not data[0]:
             return (0, 0)
 
-        seq_ids = [x.decode("ascii") for x in data[0].split()]
-        new_seqs = self._filter_new(seq_ids, known)
-        if not new_seqs:
+        uids = [int(x) for x in data[0].split()]
+        new_uids = [u for u in uids if u not in known]
+        if not new_uids:
             return (0, 0)
-        return self._download(new_seqs, folder, known)
+        return self._download(new_uids, folder, known)
 
-    def _filter_new(self, seq_ids: list[str], known: set[int]) -> list[str]:
-        """Traduce números de secuencia a UID y devuelve solo los desconocidos."""
-        uid_map: dict[int, int] = {}
-        for i in range(0, len(seq_ids), CHUNK_SIZE):
-            chunk = ",".join(seq_ids[i:i + CHUNK_SIZE])
-            typ, data = self.imap.fetch(chunk, "(UID)")
-            if typ != "OK":
-                time.sleep(1)
-                continue
-            for item in data:
-                raw = item[0] if isinstance(item, tuple) else item
-                if not isinstance(raw, bytes):
-                    continue
-                m = re.search(rb"(\d+)\s+\(.*?UID (\d+)", raw)
-                if m:
-                    uid_map[int(m.group(2))] = int(m.group(1))
-            time.sleep(PAUSE_BETWEEN_CHUNKS)
-
-        return [str(seq) for uid, seq in uid_map.items() if uid not in known]
-
-    def _download(self, seqs: list[str], folder: str, known: set[int]) -> tuple[int, int]:
+    def _download(self, uids: list[int], folder: str, known: set[int]) -> tuple[int, int]:
         n_new = n_att = 0
-        for i in range(0, len(seqs), CHUNK_SIZE):
-            chunk = ",".join(seqs[i:i + CHUNK_SIZE])
-            typ, data = self.imap.fetch(chunk, "(RFC822 FLAGS UID)")
+        for i in range(0, len(uids), CHUNK_SIZE):
+            chunk = ",".join(str(u) for u in uids[i:i + CHUNK_SIZE])
+            # BODY.PEEK[] en vez de RFC822: no marca los correos como leídos.
+            typ, data = self.imap.uid("FETCH", chunk, "(BODY.PEEK[] FLAGS UID)")
             if typ != "OK":
                 print("    ! fallo al descargar lote, se reintenta en la próxima corrida")
                 time.sleep(2)
                 continue
 
-            for j in range(0, len(data), 2):
-                if j + 1 >= len(data) or not isinstance(data[j], tuple):
+            for item in data:
+                if not isinstance(item, tuple) or len(item) < 2:
                     continue
-                raw_bytes = data[j][1]
-                meta = data[j][0].decode("ascii", "replace") if isinstance(data[j][0], bytes) else ""
+                meta = item[0].decode("ascii", "replace") if isinstance(item[0], bytes) else ""
+                raw_bytes = item[1]
 
                 uid_m = re.search(r"UID (\d+)", meta)
                 if not uid_m:
@@ -371,6 +422,7 @@ class MailboxSync:
                 msg = email.message_from_bytes(raw_bytes)
                 added, atts = self._store(msg, uid, folder, flags, raw_bytes)
                 if added:
+                    known.add(uid)
                     n_new += 1
                     n_att += atts
 
@@ -383,8 +435,12 @@ class MailboxSync:
 
         eml_name = None
         if self.save_eml:
-            eml_name = f"{uid}.eml"
-            (self.raw_dir / eml_name).write_bytes(raw_bytes)
+            # Una subcarpeta por carpeta IMAP: el mismo UID existe en varias
+            # carpetas y antes los .eml se sobrescribían entre sí.
+            eml_name = f"{safe_filename(folder)}/{uid}.eml"
+            eml_path = self.raw_dir / eml_name
+            eml_path.parent.mkdir(parents=True, exist_ok=True)
+            eml_path.write_bytes(raw_bytes)
 
         cur = self.conn.cursor()
         try:
